@@ -1,0 +1,163 @@
+// ============================================================
+// ZULIHE WATERSHED: NDVI ANALYSIS, 1995
+// Satellite: Landsat 5 TM
+// Dataset: Landsat Collection 2, Tier 1, Level 2
+// Spatial resolution: 30 m
+// Study period: May-September 1995
+// ============================================================
+
+
+// 1. STUDY AREA
+var roi = ee.FeatureCollection(
+  'projects/ee-kitessa2007/assets/zlh'
+);
+
+Map.centerObject(roi, 10);
+
+Map.addLayer(
+  roi,
+  {color: 'red'},
+  'Zulihe Watershed Boundary'
+);
+
+
+// 2. STUDY PERIOD
+var startDate = '1995-05-01';
+var endDate   = '1995-10-01';
+
+
+// 3. LANDSAT 5 CLOUD AND SHADOW MASK
+function maskLandsat5(image) {
+
+  var qa = image.select('QA_PIXEL');
+
+  // Remove fill, dilated cloud, cloud, cloud shadow and snow
+  var mask = qa.bitwiseAnd(1 << 0).eq(0)
+    .and(qa.bitwiseAnd(1 << 1).eq(0))
+    .and(qa.bitwiseAnd(1 << 3).eq(0))
+    .and(qa.bitwiseAnd(1 << 4).eq(0))
+    .and(qa.bitwiseAnd(1 << 5).eq(0));
+
+  // Remove radiometrically saturated pixels
+  var saturationMask = image.select('QA_RADSAT').eq(0);
+
+  return image
+    .updateMask(mask)
+    .updateMask(saturationMask);
+}
+
+
+// 4. LANDSAT 5 COLLECTION
+var landsat5 = ee.ImageCollection(
+  'LANDSAT/LT05/C02/T1_L2'
+)
+  .filterBounds(roi)
+  .filterDate(startDate, endDate)
+  .filter(ee.Filter.lte('CLOUD_COVER', 20))
+  .map(maskLandsat5);
+
+print('1995 Landsat 5 image count:', landsat5.size());
+
+
+// 5. SURFACE REFLECTANCE AND NDVI
+function calculateNDVI(image) {
+
+  // Apply Collection 2 surface reflectance scaling
+  var optical = image
+    .select(['SR_B3', 'SR_B4'])
+    .multiply(0.0000275)
+    .add(-0.2);
+
+  var red = optical.select('SR_B3');
+  var nir = optical.select('SR_B4');
+
+  // NDVI = (NIR - RED) / (NIR + RED)
+  var ndvi = optical.expression(
+    '(NIR - RED) / (NIR + RED)', {
+      'NIR': nir,
+      'RED': red
+    }
+  ).rename('NDVI');
+
+  return ndvi.copyProperties(
+    image,
+    ['system:time_start']
+  );
+}
+
+var ndviCollection = landsat5.map(calculateNDVI);
+
+
+// 6. SEASONAL MEDIAN COMPOSITE
+var ndvi1995 = ndviCollection
+  .median()
+  .clip(roi)
+  .rename('NDVI');
+
+
+// 7. DISPLAY NDVI
+var ndviVis = {
+  min: -0.2,
+  max: 0.8,
+  palette: [
+    '8c510a',
+    'd8b365',
+    'f6e8c3',
+    'c7eae5',
+    '5ab4ac',
+    '01665e'
+  ]
+};
+
+Map.addLayer(
+  ndvi1995,
+  ndviVis,
+  'NDVI 1995'
+);
+
+
+// 8. STATISTICS
+var ndviStats1995 = ndvi1995.reduceRegion({
+  reducer: ee.Reducer.minMax()
+    .combine({
+      reducer2: ee.Reducer.mean(),
+      sharedInputs: true
+    }),
+  geometry: roi.geometry(),
+  scale: 30,
+  maxPixels: 1e13,
+  tileScale: 4
+});
+
+print('NDVI statistics 1995:', ndviStats1995);
+
+
+// 9. VALID PIXEL COUNT
+var validPixels1995 = ndvi1995.reduceRegion({
+  reducer: ee.Reducer.count(),
+  geometry: roi.geometry(),
+  scale: 30,
+  maxPixels: 1e13,
+  tileScale: 4
+});
+
+print('Valid NDVI pixels 1995:', validPixels1995);
+
+
+// 10. EXPORT NDVI TO GOOGLE DRIVE
+Export.image.toDrive({
+  image: ndvi1995,
+  description: 'Zulihe_NDVI_1995',
+  folder: 'Zulihe_NDVI',
+  fileNamePrefix: 'Zulihe_NDVI_1995',
+  region: roi.geometry(),
+  scale: 30,
+  crs: 'EPSG:32648',
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+
+// ============================================================
+// END OF 1995 NDVI ANALYSIS
+// ============================================================
