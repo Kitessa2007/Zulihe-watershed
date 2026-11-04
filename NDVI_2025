@@ -1,0 +1,161 @@
+
+// ============================================================
+// ZULIHE WATERSHED - NDVI 2025
+// Satellites: Landsat 8 OLI + Landsat 9 OLI-2
+// Dataset: USGS Landsat Collection 2 Tier 1 Level 2
+// Growing season: May-September
+// ROI zoom: 10
+// Native spatial resolution: 30 m
+// ============================================================
+
+// 1. STUDY AREA
+var roi = ee.FeatureCollection(
+  'projects/ee-kitessa2007/assets/zlh'
+);
+var geometry = roi.geometry();
+
+Map.centerObject(roi, 10);
+Map.addLayer(roi, {color: 'red'}, 'Zulihe ROI');
+
+// 2. LANDSAT COLLECTIONS
+var landsat8 = ee.ImageCollection(
+  'LANDSAT/LC08/C02/T1_L2'
+);
+
+var landsat9 = ee.ImageCollection(
+  'LANDSAT/LC09/C02/T1_L2'
+);
+
+// 3. NDVI FUNCTION FOR LANDSAT 8 AND 9
+function calculateNDVI(image) {
+
+  var qa = image.select('QA_PIXEL');
+
+  // Mask fill, dilated cloud, cirrus, cloud,
+  // cloud shadow and snow
+  var cloudMask = qa.bitwiseAnd(1 << 0).eq(0)
+    .and(qa.bitwiseAnd(1 << 1).eq(0))
+    .and(qa.bitwiseAnd(1 << 2).eq(0))
+    .and(qa.bitwiseAnd(1 << 3).eq(0))
+    .and(qa.bitwiseAnd(1 << 4).eq(0))
+    .and(qa.bitwiseAnd(1 << 5).eq(0));
+
+  var saturationMask = image.select('QA_RADSAT').eq(0);
+
+  // Landsat 8 and 9:
+  // Red = Band 4
+  // NIR = Band 5
+  var red = image.select('SR_B4')
+    .multiply(0.0000275).add(-0.2);
+
+  var nir = image.select('SR_B5')
+    .multiply(0.0000275).add(-0.2);
+
+  var denominator = nir.add(red);
+
+  var ndvi = nir.subtract(red)
+    .divide(denominator)
+    .rename('NDVI');
+
+  return ndvi
+    .updateMask(cloudMask)
+    .updateMask(saturationMask)
+    .updateMask(denominator.abs().gt(0.0001))
+    .copyProperties(image, [
+      'system:time_start',
+      'LANDSAT_PRODUCT_ID',
+      'SPACECRAFT_ID'
+    ]);
+}
+
+// 4. FILTER LANDSAT 8
+var collection8 = landsat8
+  .filterBounds(geometry)
+  .filterDate('2025-05-01', '2025-10-01')
+  .filter(ee.Filter.lte('CLOUD_COVER', 20));
+
+print('2025 Landsat 8 scenes:', collection8.size());
+
+// 5. FILTER LANDSAT 9
+var collection9 = landsat9
+  .filterBounds(geometry)
+  .filterDate('2025-05-01', '2025-10-01')
+  .filter(ee.Filter.lte('CLOUD_COVER', 20));
+
+print('2025 Landsat 9 scenes:', collection9.size());
+
+// 6. CALCULATE NDVI SEPARATELY
+var ndvi8 = collection8.map(calculateNDVI);
+var ndvi9 = collection9.map(calculateNDVI);
+
+// 7. MERGE COLLECTIONS
+var combined = ndvi8.merge(ndvi9);
+
+print('2025 total Landsat scenes:', combined.size());
+
+// 8. SEASONAL MEDIAN COMPOSITE
+var ndvi2025 = combined
+  .median()
+  .clip(geometry)
+  .select('NDVI')
+  .set({
+    'year': 2025,
+    'season': 'May-September',
+    'satellite': 'Landsat 8 OLI and Landsat 9 OLI-2',
+    'resolution_m': 30
+  });
+
+// 9. VALID PIXEL COVERAGE
+var validPixels = ndvi2025.mask()
+  .reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: geometry,
+    scale: 30,
+    maxPixels: 1e13,
+    tileScale: 4
+  });
+
+print('2025 valid NDVI pixels:', validPixels);
+
+// 10. VISUALIZATION
+var ndviVis = {
+  min: -0.2,
+  max: 0.8,
+  palette: [
+    '8c510a',
+    'd8b365',
+    'f6e8c3',
+    'c7eae5',
+    '5ab4ac',
+    '01665e'
+  ]
+};
+
+Map.addLayer(ndvi2025, ndviVis, 'NDVI 2025');
+
+// 11. NDVI STATISTICS
+var statistics = ndvi2025.reduceRegion({
+  reducer: ee.Reducer.mean()
+    .combine(ee.Reducer.stdDev(), '', true)
+    .combine(ee.Reducer.minMax(), '', true),
+  geometry: geometry,
+  scale: 30,
+  maxPixels: 1e13,
+  tileScale: 4
+});
+
+print('2025 NDVI statistics:', statistics);
+
+// 12. EXPORT GEOTIFF
+Export.image.toDrive({
+  image: ndvi2025,
+  description: 'Zulihe_NDVI_2025',
+  folder: 'Zulihe_NDVI',
+  fileNamePrefix: 'Zulihe_NDVI_2025',
+  region: geometry,
+  scale: 30,
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+print('2025 NDVI processing complete.');
