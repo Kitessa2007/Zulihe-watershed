@@ -1,0 +1,159 @@
+
+// ============================================================
+// ZULIHE WATERSHED - NDVI 2010
+// Satellites: Landsat 5 TM + Landsat 7 ETM+
+// Dataset: USGS Landsat Collection 2 Tier 1 Level 2
+// Growing season: May-September
+// ROI zoom: 10
+// Native spatial resolution: 30 m
+// ============================================================
+
+// 1. STUDY AREA
+var roi = ee.FeatureCollection(
+  'projects/ee-kitessa2007/assets/zlh'
+);
+var geometry = roi.geometry();
+
+Map.centerObject(roi, 10);
+Map.addLayer(roi, {color: 'red'}, 'Zulihe ROI');
+
+// 2. LANDSAT COLLECTIONS
+var landsat5 = ee.ImageCollection(
+  'LANDSAT/LT05/C02/T1_L2'
+);
+
+var landsat7 = ee.ImageCollection(
+  'LANDSAT/LE07/C02/T1_L2'
+);
+
+// 3. COMMON NDVI FUNCTION FOR TM AND ETM+
+function calculateNDVI(image) {
+
+  var qa = image.select('QA_PIXEL');
+
+  // Remove fill, dilated cloud, cloud, shadow and snow
+  var cloudMask = qa.bitwiseAnd(1 << 0).eq(0)
+    .and(qa.bitwiseAnd(1 << 1).eq(0))
+    .and(qa.bitwiseAnd(1 << 3).eq(0))
+    .and(qa.bitwiseAnd(1 << 4).eq(0))
+    .and(qa.bitwiseAnd(1 << 5).eq(0));
+
+  var saturationMask = image.select('QA_RADSAT').eq(0);
+
+  // Landsat 5 and Landsat 7:
+  // Red = Band 3
+  // NIR = Band 4
+  var red = image.select('SR_B3')
+    .multiply(0.0000275).add(-0.2);
+
+  var nir = image.select('SR_B4')
+    .multiply(0.0000275).add(-0.2);
+
+  var denominator = nir.add(red);
+
+  var ndvi = nir.subtract(red)
+    .divide(denominator)
+    .rename('NDVI');
+
+  return ndvi
+    .updateMask(cloudMask)
+    .updateMask(saturationMask)
+    .updateMask(denominator.abs().gt(0.0001))
+    .copyProperties(image, [
+      'system:time_start',
+      'LANDSAT_PRODUCT_ID',
+      'SPACECRAFT_ID'
+    ]);
+}
+
+// 4. FILTER LANDSAT 5
+var collection5 = landsat5
+  .filterBounds(geometry)
+  .filterDate('2010-05-01', '2010-10-01')
+  .filter(ee.Filter.lte('CLOUD_COVER', 20));
+
+print('2010 Landsat 5 scenes:', collection5.size());
+
+// 5. FILTER LANDSAT 7
+var collection7 = landsat7
+  .filterBounds(geometry)
+  .filterDate('2010-05-01', '2010-10-01')
+  .filter(ee.Filter.lte('CLOUD_COVER', 20));
+
+print('2010 Landsat 7 scenes:', collection7.size());
+
+// 6. CALCULATE NDVI SEPARATELY
+var ndvi5 = collection5.map(calculateNDVI);
+var ndvi7 = collection7.map(calculateNDVI);
+
+// 7. MERGE NDVI COLLECTIONS
+var combined = ndvi5.merge(ndvi7);
+
+print('2010 total Landsat scenes:', combined.size());
+
+// 8. SEASONAL MEDIAN COMPOSITE
+var ndvi2010 = combined
+  .median()
+  .clip(geometry)
+  .select('NDVI')
+  .set({
+    'year': 2010,
+    'season': 'May-September',
+    'satellite': 'Landsat 5 TM and Landsat 7 ETM+',
+    'resolution_m': 30
+  });
+
+// 9. VALID PIXEL COVERAGE
+var validPixels = ndvi2010.mask()
+  .reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: geometry,
+    scale: 30,
+    maxPixels: 1e13,
+    tileScale: 4
+  });
+
+print('2010 valid NDVI pixels:', validPixels);
+
+// 10. VISUALIZATION
+var ndviVis = {
+  min: -0.2,
+  max: 0.8,
+  palette: [
+    '8c510a',
+    'd8b365',
+    'f6e8c3',
+    'c7eae5',
+    '5ab4ac',
+    '01665e'
+  ]
+};
+
+Map.addLayer(ndvi2010, ndviVis, 'NDVI 2010');
+
+// 11. NDVI STATISTICS
+var statistics = ndvi2010.reduceRegion({
+  reducer: ee.Reducer.mean()
+    .combine(ee.Reducer.stdDev(), '', true)
+    .combine(ee.Reducer.minMax(), '', true),
+  geometry: geometry,
+  scale: 30,
+  maxPixels: 1e13,
+  tileScale: 4
+});
+
+print('2010 NDVI statistics:', statistics);
+
+// 12. EXPORT GEOTIFF
+Export.image.toDrive({
+  image: ndvi2010,
+  description: 'Zulihe_NDVI_2010',
+  folder: 'Zulihe_NDVI',
+  fileNamePrefix: 'Zulihe_NDVI_2010',
+  region: geometry,
+  scale: 30,
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+print('2010 NDVI processing complete.');
