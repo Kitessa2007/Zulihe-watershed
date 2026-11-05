@@ -1,0 +1,1201 @@
+
+# =============================================================================
+# ZULIHE WATERSHED: BAYESIAN LEREI-X RESILIENCE MODELLING
+# Multi-year analysis: 1995, 2010, 2025
+# =============================================================================
+#
+# Bayesian latent-factor modelling of pre-computed resistance (R),
+# recovery (C), and adaptability (A).
+#
+# Study area: Zulihe Watershed, western Loess Plateau, China
+# Growing season: May-September
+# Spatial resolution: 10 m
+#
+# INPUT:
+#   One three-band GeoTIFF for each year:
+#   Band 1 = Resistance (R)
+#   Band 2 = Recovery (C)
+#   Band 3 = Adaptability (A)
+#
+# OUTPUT:
+#   - Annual LEREI-X GeoTIFFs (common 0-1 scale)
+#   - CmdStan chain CSV files
+#   - Posterior draws and fitted model (RDS)
+#   - Bayesian parameter and convergence summaries (CSV)
+#   - LightGBM model and feature importance
+#   - Spatial-block cross-validation results (CSV)
+#   - Annual LEREI-X statistics (CSV)
+#   - Reproducibility metadata and R session information
+#
+# IMPORTANT:
+#   This script estimates LEREI-X from pre-computed R, C, and A rasters.
+#   It does not calculate R, C, and A from satellite imagery.
+#   All input rasters must contain real Zulihe-derived data.
+# =============================================================================
+
+
+# =============================================================================
+# 1. LOAD REQUIRED PACKAGES
+# =============================================================================
+
+required_packages <- c(
+  "terra",
+  "sf",
+  "dplyr",
+  "readr",
+  "cmdstanr",
+  "posterior",
+  "lightgbm"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    quietly = TRUE,
+    FUN.VALUE = logical(1)
+  )
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Install these R packages first: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+library(terra)
+library(sf)
+library(dplyr)
+library(readr)
+library(cmdstanr)
+library(posterior)
+library(lightgbm)
+
+
+# =============================================================================
+# 2. PROJECT SETTINGS
+# =============================================================================
+
+YEARS <- c(1995, 2010, 2025)
+
+INPUT_FILES <- c(
+  "1995" = "Zulihe_Components/components_1995.tif",
+  "2010" = "Zulihe_Components/components_2010.tif",
+  "2025" = "Zulihe_Components/components_2025.tif"
+)
+
+OUTPUT_DIR <- "Zulihe_LEREI_X_Output"
+
+STUDY_AREA <- "Zulihe Watershed, Gansu-Ningxia, China"
+
+ROI_ASSET <- "ee-kitessa2007/assets/zlh"
+
+SEASON <- "May-September"
+
+EXPECTED_RESOLUTION_M <- 10
+
+N_SAMPLES_PER_YEAR <- 1000
+
+BAYESIAN_CHAINS <- 4
+
+BAYESIAN_WARMUP <- 1000
+
+BAYESIAN_DRAWS <- 1000
+
+N_CV_FOLDS <- 5
+
+SPATIAL_BLOCK_SIZE_M <- 5000
+
+RANDOM_STATE <- 42
+
+set.seed(RANDOM_STATE)
+
+
+# =============================================================================
+# 3. CHECK CMDSTAN INSTALLATION
+# =============================================================================
+
+if (is.null(cmdstanr::cmdstan_version(error_on_NA = FALSE))) {
+  stop(
+    "CmdStan is not installed. Install CmdStan using ",
+    "cmdstanr::install_cmdstan() and run this script again."
+  )
+}
+
+
+# =============================================================================
+# 4. CREATE OUTPUT DIRECTORIES
+# =============================================================================
+
+output_folders <- c(
+  "rasters",
+  "traces",
+  "summary",
+  "models",
+  "scripts"
+)
+
+for (folder in output_folders) {
+  dir.create(
+    file.path(OUTPUT_DIR, folder),
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+}
+
+
+# =============================================================================
+# 5. VALIDATE INPUT RASTERS
+# =============================================================================
+
+raster_list <- list()
+
+for (year in YEARS) {
+
+  raster_path <- INPUT_FILES[as.character(year)]
+
+  if (!file.exists(raster_path)) {
+    stop(
+      "Missing input raster for ", year, ": ", raster_path
+    )
+  }
+
+  r <- terra::rast(raster_path)
+
+  if (terra::nlyr(r) != 3) {
+    stop(
+      "The ", year,
+      " raster must contain exactly three bands: R, C, and A."
+    )
+  }
+
+  if (is.na(terra::crs(r)) || terra::crs(r) == "") {
+    stop("The raster for ", year, " has no defined CRS.")
+  }
+
+  if (any(abs(terra::res(r) - EXPECTED_RESOLUTION_M) > 0.01)) {
+    stop(
+      "The raster for ", year,
+      " does not have the expected 10 m resolution."
+    )
+  }
+
+  names(r) <- c("R", "C", "A")
+
+  raster_list[[as.character(year)]] <- r
+
+  cat(
+    "\nValidated year:", year,
+    "\nRows:", terra::nrow(r),
+    "\nColumns:", terra::ncol(r),
+    "\nResolution:", paste(terra::res(r), collapse = ", "),
+    "\nCRS:", terra::crs(r),
+    "\n"
+  )
+}
+
+
+# Confirm that all annual rasters use the same grid geometry.
+
+reference_raster <- raster_list[["1995"]]
+
+for (year in c(2010, 2025)) {
+
+  current_raster <- raster_list[[as.character(year)]]
+
+  same_geometry <- terra::compareGeom(
+    reference_raster,
+    current_raster,
+    stopOnError = FALSE
+  )
+
+  if (!same_geometry) {
+    stop(
+      "Raster geometry mismatch for ", year,
+      ". Align CRS, extent, resolution, and origin before modelling."
+    )
+  }
+}
+
+
+# Spatial blocking in metres requires a projected CRS.
+
+if (sf::st_is_longlat(sf::st_crs(terra::crs(reference_raster)))) {
+  stop(
+    "The input rasters use a geographic CRS. ",
+    "Reproject the rasters to an appropriate projected CRS ",
+    "with metre units before using the 5,000 m spatial blocks."
+  )
+}
+
+
+# =============================================================================
+# 6. EXTRACT VALID PIXEL SAMPLES
+# =============================================================================
+
+extract_samples <- function(
+    raster,
+    year,
+    n_samples = 1000,
+    random_state = 42
+) {
+
+  set.seed(random_state)
+
+  # Randomly sample points from pixels with complete R, C, and A values.
+  sampled_points <- terra::spatSample(
+    raster,
+    size = n_samples,
+    method = "random",
+    na.rm = TRUE,
+    as.points = TRUE,
+    values = TRUE
+  )
+
+  if (is.null(sampled_points) || nrow(sampled_points) == 0) {
+    stop("No valid sampled pixels for year ", year)
+  }
+
+  sampled_values <- as.data.frame(
+    terra::values(sampled_points)
+  )
+
+  sampled_coordinates <- terra::crds(
+    sampled_points,
+    df = TRUE
+  )
+
+  # Use the three raster values and their spatial coordinates.
+  if (ncol(sampled_values) < 3) {
+    stop(
+      "Could not extract all three component values for year ",
+      year
+    )
+  }
+
+  names(sampled_values)[1:3] <- c("R", "C", "A")
+
+  sample_data <- data.frame(
+    year = year,
+    R = sampled_values$R,
+    C = sampled_values$C,
+    A = sampled_values$A,
+    x = sampled_coordinates[, 1],
+    y = sampled_coordinates[, 2]
+  )
+
+  sample_data <- sample_data[
+    complete.cases(sample_data) &
+      apply(
+        sample_data[, c("R", "C", "A", "x", "y")],
+        1,
+        function(z) all(is.finite(z))
+      ),
+  ]
+
+  if (nrow(sample_data) < 100) {
+    stop(
+      "Fewer than 100 valid samples were obtained for year ",
+      year,
+      ". Check the input raster and NoData values."
+    )
+  }
+
+  sample_data
+}
+
+
+# =============================================================================
+# 7. POOL SAMPLES FROM ALL YEARS
+# =============================================================================
+
+sample_list <- list()
+
+for (year in YEARS) {
+
+  cat("\nSampling Zulihe component data for:", year, "\n")
+
+  sample_list[[as.character(year)]] <- extract_samples(
+    raster = raster_list[[as.character(year)]],
+    year = year,
+    n_samples = N_SAMPLES_PER_YEAR,
+    random_state = RANDOM_STATE + year
+  )
+}
+
+sample_df <- dplyr::bind_rows(sample_list)
+
+readr::write_csv(
+  sample_df,
+  file.path(
+    OUTPUT_DIR,
+    "summary",
+    "pooled_component_samples.csv"
+  )
+)
+
+cat(
+  "\nTotal pooled samples:",
+  nrow(sample_df),
+  "\n"
+)
+
+
+# =============================================================================
+# 8. COMMON COMPONENT STANDARDISATION
+# =============================================================================
+
+component_names <- c("R", "C", "A")
+
+component_means <- vapply(
+  sample_df[, component_names],
+  mean,
+  numeric(1)
+)
+
+component_sds <- vapply(
+  sample_df[, component_names],
+  sd,
+  numeric(1)
+)
+
+if (
+  any(!is.finite(component_sds)) ||
+  any(component_sds < 1e-10)
+) {
+  stop("One or more components have zero or near-zero variance.")
+}
+
+X <- as.matrix(
+  sample_df[, component_names]
+)
+
+Xz <- scale(
+  X,
+  center = component_means,
+  scale = component_sds
+)
+
+storage.mode(Xz) <- "double"
+
+colnames(Xz) <- component_names
+
+standardisation_parameters <- data.frame(
+  component = component_names,
+  mean = as.numeric(component_means),
+  standard_deviation = as.numeric(component_sds)
+)
+
+readr::write_csv(
+  standardisation_parameters,
+  file.path(
+    OUTPUT_DIR,
+    "summary",
+    "standardisation_parameters.csv"
+  )
+)
+
+
+# =============================================================================
+# 9. BAYESIAN ONE-FACTOR MODEL
+# =============================================================================
+
+# The model estimates a common latent resilience factor:
+#
+#   R[n] = lambda_R * eta[n] + error_R[n]
+#   C[n] = lambda_C * eta[n] + error_C[n]
+#   A[n] = lambda_A * eta[n] + error_A[n]
+#
+# eta[n] represents the latent resilience score for sampled pixel n.
+# Positive loadings orient the factor toward higher component values.
+#
+# This model assumes that higher values of all three input components
+# represent better ecological condition. Reverse-code any component
+# whose direction represents degradation before running this script.
+
+stan_code <- "
+data {
+  int<lower=1> N;
+  matrix[N, 3] X;
+}
+
+parameters {
+  vector[N] eta;
+  vector<lower=0>[3] lambda;
+  vector<lower=0>[3] sigma;
+}
+
+model {
+
+  eta ~ normal(0, 1);
+
+  lambda ~ normal(0, 1);
+  sigma ~ normal(0, 1);
+
+  for (n in 1:N) {
+
+    X[n, 1] ~ normal(lambda[1] * eta[n], sigma[1]);
+
+    X[n, 2] ~ normal(lambda[2] * eta[n], sigma[2]);
+
+    X[n, 3] ~ normal(lambda[3] * eta[n], sigma[3]);
+
+  }
+}
+
+generated quantities {
+
+  vector[3] loading_share;
+
+  loading_share = lambda / sum(lambda);
+
+}
+"
+
+stan_file <- file.path(
+  OUTPUT_DIR,
+  "models",
+  "Zulihe_Bayesian_LEREI_X.stan"
+)
+
+writeLines(
+  stan_code,
+  stan_file
+)
+
+stan_model <- cmdstanr::cmdstan_model(
+  stan_file,
+  quiet = TRUE
+)
+
+stan_data <- list(
+  N = nrow(Xz),
+  X = Xz
+)
+
+cat("\nFitting pooled Bayesian latent resilience model...\n")
+
+fit <- stan_model$sample(
+  data = stan_data,
+  seed = RANDOM_STATE,
+  chains = BAYESIAN_CHAINS,
+  parallel_chains = BAYESIAN_CHAINS,
+  iter_warmup = BAYESIAN_WARMUP,
+  iter_sampling = BAYESIAN_DRAWS,
+  adapt_delta = 0.95,
+  refresh = 100,
+  output_dir = file.path(OUTPUT_DIR, "traces")
+)
+
+saveRDS(
+  fit,
+  file.path(
+    OUTPUT_DIR,
+    "traces",
+    "Zulihe_Bayesian_model.rds"
+  )
+)
+
+
+# =============================================================================
+# 10. EXTRACT POSTERIOR RESULTS
+# =============================================================================
+
+eta_draws <- posterior::as_draws_matrix(
+  fit$draws(variables = "eta")
+)
+
+eta_mean <- colMeans(eta_draws)
+
+if (length(eta_mean) != nrow(sample_df)) {
+  stop("Posterior latent scores do not match the pooled sample rows.")
+}
+
+loading_draws <- posterior::as_draws_matrix(
+  fit$draws(variables = "lambda")
+)
+
+loading_mean <- colMeans(loading_draws)
+
+names(loading_mean) <- component_names
+
+loading_shares <- loading_mean / sum(loading_mean)
+
+names(loading_shares) <- component_names
+
+posterior_results <- data.frame(
+  component = component_names,
+  loading = as.numeric(loading_mean),
+  loading_share = as.numeric(loading_shares)
+)
+
+readr::write_csv(
+  posterior_results,
+  file.path(
+    OUTPUT_DIR,
+    "summary",
+    "Bayesian_factor_loadings.csv"
+  )
+)
+
+# Save posterior draws as a CSV file.
+posterior_draws <- posterior::as_draws_df(
+  fit$draws(
+    variables = c("eta", "lambda", "sigma", "loading_share")
+  )
+)
+
+readr::write_csv(
+  posterior_draws,
+  file.path(
+    OUTPUT_DIR,
+    "traces",
+    "Zulihe_Bayesian_posterior_draws.csv"
+  )
+)
+
+# Save parameter summaries.
+posterior_summary <- fit$summary(
+  variables = c("lambda", "sigma", "loading_share")
+)
+
+readr::write_csv(
+  posterior_summary,
+  file.path(
+    OUTPUT_DIR,
+    "summary",
+    "Bayesian_parameter_summary.csv"
+  )
+)
+
+
+# =============================================================================
+# 11. BAYESIAN CONVERGENCE DIAGNOSTICS
+# =============================================================================
+
+diagnostics <- fit$summary(
+  variables = c("lambda", "sigma")
+)
+
+max_rhat <- max(
+  diagnostics$rhat,
+  na.rm = TRUE
+)
+
+min_ess_bulk <- min(
+  diagnostics$ess_bulk,
+  na.rm = TRUE
+)
+
+min_ess_tail <- min(
+  diagnostics$ess_tail,
+  na.rm = TRUE
+)
+
+convergence_results <- data.frame(
+  maximum_Rhat = max_rhat,
+  minimum_ESS_bulk = min_ess_bulk,
+  minimum_ESS_tail = min_ess_tail
+)
+
+readr::write_csv(
+  convergence_results,
+  file.path(
+    OUTPUT_DIR,
+    "summary",
+    "Bayesian_convergence_diagnostics.csv"
+  )
+)
+
+cat(
+  "\nMaximum R-hat:", max_rhat,
+  "\nMinimum bulk ESS:", min_ess_bulk,
+  "\nMinimum tail ESS:", min_ess_tail,
+  "\n"
+)
+
+
+# =============================================================================
+# 12. LIGHTGBM SURROGATE MODEL
+# =============================================================================
+
+train_data <- lightgbm::lgb.Dataset(
+  data = Xz,
+  label = as.numeric(eta_mean),
+  free_raw_data = FALSE
+)
+
+lgb_parameters <- list(
+  objective = "regression",
+  metric = "rmse",
+  learning_rate = 0.05,
+  num_leaves = 15,
+  max_depth = -1,
+  feature_fraction = 1.0,
+  bagging_fraction = 1.0,
+  verbosity = -1,
+  seed = RANDOM_STATE,
+  num_threads = 4
+)
+
+surrogate_model <- lightgbm::lgb.train(
+  params = lgb_parameters,
+  data = train_data,
+  nrounds = 300,
+  verbose = -1
+)
+
+train_predictions <- predict(
+  surrogate_model,
+  Xz
+)
+
+# Conventional predictive R-squared.
+calculate_r2 <- function(observed, predicted) {
+
+  denominator <- sum(
+    (observed - mean(observed))^2
+  )
+
+  if (denominator <= 0) {
+    return(NA_real_)
+  }
+
+  1 - sum(
+    (observed - predicted)^2
+  ) / denominator
+}
+
+calculate_rmse <- function(observed, predicted) {
+  sqrt(mean((observed - predicted)^2))
+}
+
+train_r2 <- calculate_r2(
+  eta_mean,
+  train_predictions
+)
+
+train_rmse <- calculate_rmse(
+  eta_mean,
+  train_predictions
+)
+
+lightgbm::lgb.save(
+  surrogate_model,
+  file.path(
+    OUTPUT_DIR,
+    "models",
+    "Zulihe_LEREI_X_LightGBM.txt"
+  )
+)
+
+feature_importance <- lightgbm::lgb.importance(
+  surrogate_model,
+  percentage = TRUE
+)
+
+readr::write_csv(
+  feature_importance,
+  file.path(
+    OUTPUT_DIR,
+    "summary",
+    "LightGBM_feature_importance.csv"
+  )
+)
+
+
+# =============================================================================
+# 13. COMMON 0-1 SCALING
+# =============================================================================
+
+# One pooled scaling range is used for all three years.
+# The range is based on the pooled posterior mean latent scores.
+
+latent_min <- min(
+  eta_mean,
+  na.rm = TRUE
+)
+
+latent_max <- max(
+  eta_mean,
+  na.rm = TRUE
+)
+
+if (!is.finite(latent_min) ||
+    !is.finite(latent_max) ||
+    latent_max <= latent_min) {
+  stop("The pooled latent scores cannot be scaled to 0-1.")
+}
+
+scale_lerei <- function(x) {
+
+  scaled <- (x - latent_min) / (latent_max - latent_min)
+
+  pmin(
+    pmax(scaled, 0),
+    1
+  )
+}
+
+
+# =============================================================================
+# 14. SPATIAL-BLOCK CROSS-VALIDATION
+# =============================================================================
+
+# Spatial blocks are constructed in projected map coordinates.
+# Each grid block is assigned wholly to one fold.
+# This evaluates prediction in held-out spatial blocks; it is not
+# independent ecological validation of the LEREI-X indicators.
+
+spatial_block_cv <- function(
+    Xz,
+    eta,
+    coordinates,
+    n_folds = 5,
+    block_size = 5000,
+    random_state = 42
+) {
+
+  if (nrow(coordinates) != nrow(Xz)) {
+    stop("Coordinates and predictor rows do not match.")
+  }
+
+  block_x <- floor(
+    (coordinates[, 1] - min(coordinates[, 1])) / block_size
+  )
+
+  block_y <- floor(
+    (coordinates[, 2] - min(coordinates[, 2])) / block_size
+  )
+
+  block_id <- paste(
+    block_x,
+    block_y,
+    sep = "_"
+  )
+
+  unique_blocks <- unique(block_id)
+
+  if (length(unique_blocks) < n_folds) {
+    stop(
+      "There are fewer spatial blocks than CV folds. ",
+      "Reduce the number of folds or adjust block size."
+    )
+  }
+
+  set.seed(random_state)
+
+  shuffled_blocks <- sample(unique_blocks)
+
+  block_fold <- rep(
+    seq_len(n_folds),
+    length.out = length(shuffled_blocks)
+  )
+
+  names(block_fold) <- shuffled_blocks
+
+  fold_id <- unname(
+    block_fold[block_id]
+  )
+
+  results <- list()
+
+  for (fold in seq_len(n_folds)) {
+
+    test_index <- which(fold_id == fold)
+
+    train_index <- which(fold_id != fold)
+
+    if (
+      length(test_index) < 20 ||
+      length(train_index) < 50
+    ) {
+      next
+    }
+
+    fold_train <- lightgbm::lgb.Dataset(
+      data = Xz[train_index, , drop = FALSE],
+      label = as.numeric(eta[train_index])
+    )
+
+    fold_model <- lightgbm::lgb.train(
+      params = lgb_parameters,
+      data = fold_train,
+      nrounds = 250,
+      verbose = -1
+    )
+
+    predictions <- predict(
+      fold_model,
+      Xz[test_index, , drop = FALSE]
+    )
+
+    results[[as.character(fold)]] <- data.frame(
+      fold = fold,
+      n_train = length(train_index),
+      n_test = length(test_index),
+      cv_R2 = calculate_r2(
+        eta[test_index],
+        predictions
+      ),
+      cv_RMSE = calculate_rmse(
+        eta[test_index],
+        predictions
+      )
+    )
+  }
+
+  if (length(results) == 0) {
+    stop(
+      "No valid spatial CV folds were produced. ",
+      "Review the sample distribution and block size."
+    )
+  }
+
+  dplyr::bind_rows(results)
+}
+
+coordinates <- as.matrix(
+  sample_df[, c("x", "y")]
+)
+
+cat("\nRunning spatial-block cross-validation...\n")
+
+cv_results <- spatial_block_cv(
+  Xz = Xz,
+  eta = eta_mean,
+  coordinates = coordinates,
+  n_folds = N_CV_FOLDS,
+  block_size = SPATIAL_BLOCK_SIZE_M,
+  random_state = RANDOM_STATE
+)
+
+readr::write_csv(
+  cv_results,
+  file.path(
+    OUTPUT_DIR,
+    "summary",
+    "spatial_block_CV_results.csv"
+  )
+)
+
+cv_r2 <- mean(
+  cv_results$cv_R2,
+  na.rm = TRUE
+)
+
+cv_rmse <- mean(
+  cv_results$cv_RMSE,
+  na.rm = TRUE
+)
+
+
+# =============================================================================
+# 15. ANNUAL LEREI-X RASTER GENERATION
+# =============================================================================
+
+generate_lerei_raster <- function(
+    input_raster,
+    year,
+    output_path,
+    model,
+    component_means,
+    component_sds
+) {
+
+  r <- terra::rast(input_raster)
+
+  if (terra::nlyr(r) != 3) {
+    stop("Expected three component bands for year ", year)
+  }
+
+  names(r) <- c("R", "C", "A")
+
+  # terra::app supplies a matrix:
+  # rows = raster cells; columns = R, C, and A.
+
+  prediction_function <- function(v) {
+
+    v <- as.matrix(v)
+
+    output <- rep(
+      NA_real_,
+      nrow(v)
+    )
+
+    valid <- complete.cases(v) &
+      apply(
+        v,
+        1,
+        function(z) all(is.finite(z))
+      )
+
+    if (any(valid)) {
+
+      X_new <- v[
+        valid,
+        1:3,
+        drop = FALSE
+      ]
+
+      X_new_z <- sweep(
+        X_new,
+        2,
+        component_means,
+        "-"
+      )
+
+      X_new_z <- sweep(
+        X_new_z,
+        2,
+        component_sds,
+        "/"
+      )
+
+      predictions <- predict(
+        model,
+        X_new_z
+      )
+
+      output[valid] <- scale_lerei(
+        predictions
+      )
+    }
+
+    output
+  }
+
+  terra::app(
+    r,
+    fun = prediction_function,
+    filename = output_path,
+    overwrite = TRUE,
+    wopt = list(
+      datatype = "FLT4S",
+      gdal = c(
+        "COMPRESS=LZW",
+        "TILED=YES"
+      )
+    )
+  )
+
+  cat(
+    "\nGenerated annual LEREI-X raster:",
+    year,
+    "\n"
+  )
+
+  output_path
+}
+
+
+# =============================================================================
+# 16. GENERATE ANNUAL ZULIHE LEREI-X MAPS
+# =============================================================================
+
+raster_outputs <- list()
+
+for (year in YEARS) {
+
+  output_path <- file.path(
+    OUTPUT_DIR,
+    "rasters",
+    paste0(
+      "Zulihe_LEREI_X_",
+      year,
+      ".tif"
+    )
+  )
+
+  raster_outputs[[as.character(year)]] <- generate_lerei_raster(
+    input_raster = INPUT_FILES[as.character(year)],
+    year = year,
+    output_path = output_path,
+    model = surrogate_model,
+    component_means = component_means,
+    component_sds = component_sds
+  )
+}
+
+
+# =============================================================================
+# 17. ANNUAL LEREI-X STATISTICS
+# =============================================================================
+
+annual_statistics <- list()
+
+for (year in YEARS) {
+
+  output_raster <- terra::rast(
+    raster_outputs[[as.character(year)]]
+  )
+
+  raster_values <- terra::values(
+    output_raster,
+    mat = FALSE
+  )
+
+  raster_values <- raster_values[
+    is.finite(raster_values)
+  ]
+
+  if (length(raster_values) == 0) {
+    stop("No valid LEREI-X pixels were generated for ", year)
+  }
+
+  annual_statistics[[as.character(year)]] <- data.frame(
+    year = year,
+    mean_LEREI_X = mean(raster_values),
+    sd_LEREI_X = sd(raster_values),
+    minimum = min(raster_values),
+    maximum = max(raster_values),
+    median = median(raster_values),
+    valid_pixels = length(raster_values)
+  )
+}
+
+annual_statistics_df <- dplyr::bind_rows(
+  annual_statistics
+)
+
+readr::write_csv(
+  annual_statistics_df,
+  file.path(
+    OUTPUT_DIR,
+    "summary",
+    "annual_LEREI_X_statistics.csv"
+  )
+)
+
+
+# =============================================================================
+# 18. FINAL MODEL SUMMARY
+# =============================================================================
+
+summary_records <- data.frame(
+  study_area = STUDY_AREA,
+  season = SEASON,
+  years = paste(YEARS, collapse = ";"),
+  spatial_resolution_m = EXPECTED_RESOLUTION_M,
+  total_pooled_samples = nrow(sample_df),
+  samples_1995 = sum(sample_df$year == 1995),
+  samples_2010 = sum(sample_df$year == 2010),
+  samples_2025 = sum(sample_df$year == 2025),
+  loading_R = unname(loading_mean["R"]),
+  loading_C = unname(loading_mean["C"]),
+  loading_A = unname(loading_mean["A"]),
+  share_R = unname(loading_shares["R"]),
+  share_C = unname(loading_shares["C"]),
+  share_A = unname(loading_shares["A"]),
+  maximum_Rhat = max_rhat,
+  minimum_ESS_bulk = min_ess_bulk,
+  minimum_ESS_tail = min_ess_tail,
+  training_R2 = train_r2,
+  training_RMSE = train_rmse,
+  spatial_CV_R2 = cv_r2,
+  spatial_CV_RMSE = cv_rmse
+)
+
+readr::write_csv(
+  summary_records,
+  file.path(
+    OUTPUT_DIR,
+    "summary",
+    "Zulihe_LEREI_X_metrics.csv"
+  )
+)
+
+
+# =============================================================================
+# 19. SAVE REPRODUCIBILITY INFORMATION
+# =============================================================================
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(
+    OUTPUT_DIR,
+    "summary",
+    "R_sessionInfo.txt"
+  )
+)
+
+metadata <- c(
+  paste("Study area:", STUDY_AREA),
+  paste("ROI asset reference:", ROI_ASSET),
+  paste("Analysis years:", paste(YEARS, collapse = ", ")),
+  paste("Growing season:", SEASON),
+  paste("Spatial resolution:", EXPECTED_RESOLUTION_M, "m"),
+  paste("Random seed:", RANDOM_STATE),
+  paste("Samples per year requested:", N_SAMPLES_PER_YEAR),
+  paste("Bayesian chains:", BAYESIAN_CHAINS),
+  paste("Bayesian warmup iterations:", BAYESIAN_WARMUP),
+  paste("Bayesian sampling iterations:", BAYESIAN_DRAWS),
+  paste("Spatial CV folds:", N_CV_FOLDS),
+  paste("Spatial block size:", SPATIAL_BLOCK_SIZE_M, "m"),
+  paste("CmdStan version:", as.character(cmdstanr::cmdstan_version()))
+)
+
+writeLines(
+  metadata,
+  file.path(
+    OUTPUT_DIR,
+    "summary",
+    "project_metadata.txt"
+  )
+)
+
+# Save the complete R script used for this analysis separately
+# in the scripts folder when preparing the repository release.
+
+
+# =============================================================================
+# 20. FINAL OUTPUT
+# =============================================================================
+
+cat(
+  "\n============================================================\n",
+  "ZULIHE WATERSHED LEREI-X MODELLING FINISHED\n",
+  "============================================================\n"
+)
+
+cat(
+  "\nStudy area:", STUDY_AREA,
+  "\nYears:", paste(YEARS, collapse = ", "),
+  "\nSeason:", SEASON,
+  "\nResolution:", EXPECTED_RESOLUTION_M, "m",
+  "\n"
+)
+
+cat("\nBayesian factor loadings:\n")
+print(posterior_results)
+
+cat("\nConvergence diagnostics:\n")
+print(convergence_results)
+
+cat("\nSurrogate model performance:\n")
+cat(
+  "Training R2:", train_r2,
+  "\nTraining RMSE:", train_rmse,
+  "\nSpatial CV R2:", cv_r2,
+  "\nSpatial CV RMSE:", cv_rmse,
+  "\n"
+)
+
+cat("\nAnnual LEREI-X statistics:\n")
+print(annual_statistics_df)
+
+cat("\nAnnual raster outputs:\n")
+print(unlist(raster_outputs))
+
+cat(
+  "\nOutput directory:",
+  OUTPUT_DIR,
+  "\n"
+)
+
+cat("\nZULIHE LEREI-X ANALYSIS COMPLETED.\n")
+
+# =============================================================================
+# END OF SCRIPT
+# =============================================================================
