@@ -43,6 +43,3 @@ All input values must originate from the actual
 study data and fitted model. No simulated or
 artificial observations are included.
 
-## License
-Specify the license applicable to the shared
-data and code.
