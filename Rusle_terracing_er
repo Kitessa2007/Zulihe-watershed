@@ -1,0 +1,752 @@
+
+// ============================================================================
+// ZULIHE WATERSHED: TERRACE-AWARE RUSLE EROSION ASSESSMENT
+// Study area: Zulihe Watershed, Loess Plateau, China
+// Benchmark years: 1995, 2010, 2025
+// Working resolution: 1 km
+//
+// Platform: Google Earth Engine JavaScript
+//
+// DATA SOURCES:
+// 1. CHIRPS Daily precipitation
+// 2. ERA5-Land Daily precipitation
+// 3. Landsat Collection 2 Level-2 Surface Reflectance
+// 4. SRTM DEM
+// 5. OpenLandMap soil organic carbon and texture
+//
+// IMPORTANT SCIENTIFIC NOTE:
+// This is an empirical, comparative RUSLE-style model.
+// R and K are proxies and require local calibration before
+// reporting absolute erosion rates in t ha-1 yr-1.
+//
+// TERRACE INPUT:
+// Default mode uses a hypothetical uniform 30% terrace fraction.
+// Replace it with actual mapped terrace-fraction images for
+// scientifically defensible spatial estimates.
+// ============================================================================
+
+
+// ============================================================================
+// 1. USER SETTINGS
+// ============================================================================
+
+// Zulihe watershed boundary
+var roi = ee.FeatureCollection(
+  'projects/ee-kitessa2007/assets/zlh'
+);
+
+var region = roi.geometry();
+
+Map.centerObject(region, 9);
+Map.addLayer(
+  roi.style({color: 'red', fillColor: '00000000', width: 2}),
+  {},
+  'Zulihe Watershed Boundary'
+);
+
+// Projection and resolution
+var TARGET_SCALE = 1000;
+var CRS = 'EPSG:32648';
+
+// Benchmark years
+var years = [1995, 2010, 2025];
+
+// Terrace attenuation parameter
+var ETA = 0.5;
+
+// Maximum LS factor
+var LS_MAX = 20;
+
+// --------------------------------------------------------------------------
+// TERRACE DATA SETTINGS
+// --------------------------------------------------------------------------
+
+// false = use a hypothetical uniform terrace scenario.
+// true  = use your uploaded terrace fraction images.
+//
+// For actual research results, use true after uploading your maps.
+
+var USE_TERRACE_ASSETS = false;
+
+// Hypothetical scenario only: 30% terrace coverage throughout ROI.
+var SCENARIO_TERRACE_FRACTION = 0.30;
+
+// Replace these paths with your real uploaded terrace fraction assets.
+// Each image must contain values from 0 to 1.
+
+var terracePaths = {
+  1995: 'projects/ee-kitessa2007/assets/terrace_fraction_1995',
+  2010: 'projects/ee-kitessa2007/assets/terrace_fraction_2010',
+  2025: 'projects/ee-kitessa2007/assets/terrace_fraction_2025'
+};
+
+// Google Drive export folder
+var EXPORT_FOLDER = 'Zulihe_RUSLE_Results';
+
+
+// ============================================================================
+// 2. BASIC FUNCTIONS
+// ============================================================================
+
+function yearStart(year) {
+  return ee.Date.fromYMD(year, 1, 1);
+}
+
+function yearEnd(year) {
+  return ee.Date.fromYMD(year + 1, 1, 1);
+}
+
+function to1km(image) {
+  return image
+    .clip(region)
+    .resample('bilinear')
+    .reproject({
+      crs: CRS,
+      scale: TARGET_SCALE
+    });
+}
+
+
+// ============================================================================
+// 3. TERRACE FRACTION
+// ============================================================================
+
+function loadTerraceFraction(year) {
+
+  if (USE_TERRACE_ASSETS) {
+
+    var path = terracePaths[year];
+
+    return ee.Image(path)
+      .select([0])
+      .rename('terrace_fraction')
+      .clamp(0, 1)
+      .clip(region)
+      .resample('bilinear')
+      .reproject({
+        crs: CRS,
+        scale: TARGET_SCALE
+      });
+
+  } else {
+
+    return ee.Image.constant(SCENARIO_TERRACE_FRACTION)
+      .rename('terrace_fraction')
+      .clip(region)
+      .reproject({
+        crs: CRS,
+        scale: TARGET_SCALE
+      });
+
+  }
+
+}
+
+
+// ============================================================================
+// 4. TERRAIN FACTORS
+// ============================================================================
+
+// SRTM elevation
+var dem = ee.Image('USGS/SRTMGL1_003')
+  .select('elevation')
+  .clip(region);
+
+// Calculate slope from the original DEM
+var slopeDegrees = ee.Terrain.slope(dem);
+
+var slopeRadians = slopeDegrees
+  .multiply(Math.PI / 180);
+
+// Simplified slope-length factor
+var slopeLength = ee.Image.constant(1000);
+
+var m = 0.4;
+var n = 1.3;
+
+var LSbase = slopeLength
+  .divide(22.13)
+  .pow(m)
+  .multiply(
+    slopeRadians.sin()
+      .divide(0.0896)
+      .max(0)
+      .pow(n)
+  )
+  .rename('LS_factor')
+  .clamp(0.001, LS_MAX)
+  .clip(region);
+
+Map.addLayer(
+  slopeDegrees,
+  {min: 0, max: 35, palette: ['white', 'yellow', 'orange', 'red']},
+  'Slope'
+);
+
+
+// ============================================================================
+// 5. SOIL FACTOR
+// ============================================================================
+
+// OpenLandMap soil organic carbon
+var soc = ee.Image(
+  'OpenLandMap/SOL/SOL_ORGANIC-CARBON_USDA-6A1C_M/v02'
+)
+  .select('b0')
+  .divide(10)
+  .rename('SOC_percent')
+  .clip(region);
+
+// OpenLandMap soil texture class
+var texture = ee.Image(
+  'OpenLandMap/SOL/SOL_TEXTURE-CLASS_USDA-TT_M/v02'
+)
+  .select('b0')
+  .rename('texture_class')
+  .clip(region);
+
+// Convert texture classes to approximate texture weights.
+// These weights are empirical proxies, not calibrated K values.
+
+var textureWeight = texture.expression(
+  "tex == 10 || tex == 11 ? 0.45 : " +
+  "tex == 9 ? 0.35 : " +
+  "tex == 7 || tex == 8 ? 0.25 : " +
+  "tex <= 4 ? 0.18 : 0.22",
+  {
+    tex: texture
+  }
+).rename('texture_weight');
+
+// Normalize SOC within the study area
+var socStats = soc.reduceRegion({
+  reducer: ee.Reducer.percentile([2, 98]),
+  geometry: region,
+  scale: TARGET_SCALE,
+  bestEffort: true,
+  maxPixels: 1e13,
+  tileScale: 4
+});
+
+var socP2 = ee.Number(socStats.get('SOC_percent_p2'));
+var socP98 = ee.Number(socStats.get('SOC_percent_p98'));
+
+var socRange = socP98.subtract(socP2).max(0.001);
+
+var socNormalized = soc
+  .subtract(socP2)
+  .divide(socRange)
+  .clamp(0, 1);
+
+// Empirical soil erodibility proxy
+var K = textureWeight
+  .multiply(
+    ee.Image.constant(1)
+      .subtract(socNormalized.multiply(0.5))
+  )
+  .rename('K_factor')
+  .clamp(0.05, 0.6)
+  .clip(region);
+
+
+// ============================================================================
+// 6. CLIMATE FACTORS
+// ============================================================================
+
+// Annual CHIRPS precipitation in mm
+function annualPrecipitation(year) {
+
+  var collection = ee.ImageCollection(
+    'UCSB-CHG/CHIRPS/DAILY'
+  )
+    .filterBounds(region)
+    .filterDate(yearStart(year), yearEnd(year));
+
+  return collection
+    .select('precipitation')
+    .sum()
+    .rename('annual_precipitation_mm')
+    .clip(region);
+
+}
+
+
+// ERA5-Land rainfall days.
+// total_precipitation_sum is in metres per day.
+// 0.001 m = 1 mm.
+function annualRainDays(year) {
+
+  var collection = ee.ImageCollection(
+    'ECMWF/ERA5_LAND/DAILY_AGGR'
+  )
+    .filterBounds(region)
+    .filterDate(yearStart(year), yearEnd(year))
+    .select('total_precipitation_sum');
+
+  return collection
+    .map(function(image) {
+      return image.gt(0.001)
+        .rename('rain_day');
+    })
+    .sum()
+    .rename('rain_days')
+    .clip(region);
+
+}
+
+
+// ============================================================================
+// 7. LANDSAT NDVI
+// ============================================================================
+
+// Landsat 5 and Landsat 7 preparation
+function prepareL57(image) {
+
+  var qa = image.select('QA_PIXEL');
+
+  var mask = qa.bitwiseAnd(1 << 0).eq(0)
+    .and(qa.bitwiseAnd(1 << 1).eq(0))
+    .and(qa.bitwiseAnd(1 << 3).eq(0))
+    .and(qa.bitwiseAnd(1 << 4).eq(0))
+    .and(qa.bitwiseAnd(1 << 5).eq(0));
+
+  var red = image.select('SR_B3')
+    .multiply(0.0000275)
+    .add(-0.2);
+
+  var nir = image.select('SR_B4')
+    .multiply(0.0000275)
+    .add(-0.2);
+
+  var ndvi = nir.subtract(red)
+    .divide(nir.add(red))
+    .rename('NDVI');
+
+  return ndvi
+    .updateMask(mask)
+    .copyProperties(image, ['system:time_start']);
+
+}
+
+
+// Landsat 8 and Landsat 9 preparation
+function prepareL89(image) {
+
+  var qa = image.select('QA_PIXEL');
+
+  var mask = qa.bitwiseAnd(1 << 0).eq(0)
+    .and(qa.bitwiseAnd(1 << 1).eq(0))
+    .and(qa.bitwiseAnd(1 << 2).eq(0))
+    .and(qa.bitwiseAnd(1 << 3).eq(0))
+    .and(qa.bitwiseAnd(1 << 4).eq(0))
+    .and(qa.bitwiseAnd(1 << 5).eq(0));
+
+  var red = image.select('SR_B4')
+    .multiply(0.0000275)
+    .add(-0.2);
+
+  var nir = image.select('SR_B5')
+    .multiply(0.0000275)
+    .add(-0.2);
+
+  var ndvi = nir.subtract(red)
+    .divide(nir.add(red))
+    .rename('NDVI');
+
+  return ndvi
+    .updateMask(mask)
+    .copyProperties(image, ['system:time_start']);
+
+}
+
+
+// Annual growing-season NDVI
+function annualNDVI(year) {
+
+  var start = ee.Date.fromYMD(year, 5, 1);
+  var end = ee.Date.fromYMD(year, 10, 1);
+
+  var landsat;
+
+  if (year <= 2012) {
+
+    var l5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+      .filterBounds(region)
+      .filterDate(start, end)
+      .map(prepareL57);
+
+    var l7 = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+      .filterBounds(region)
+      .filterDate(start, end)
+      .map(prepareL57);
+
+    landsat = l5.merge(l7);
+
+  } else {
+
+    var l8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+      .filterBounds(region)
+      .filterDate(start, end)
+      .map(prepareL89);
+
+    var l9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+      .filterBounds(region)
+      .filterDate(start, end)
+      .map(prepareL89);
+
+    landsat = l8.merge(l9);
+
+  }
+
+  print('Landsat image count for ' + year, landsat.size());
+
+  return landsat
+    .median()
+    .rename('NDVI')
+    .clip(region);
+
+}
+
+
+// ============================================================================
+// 8. MAIN RUSLE PROCESSING
+// ============================================================================
+
+var summaryList = [];
+
+var visReduction;
+var visTerrace;
+var visualYear = 2025;
+
+years.forEach(function(year) {
+
+  print('======================================');
+  print('Processing Zulihe year: ' + year);
+  print('======================================');
+
+  // Input data
+  var terraceFraction = loadTerraceFraction(year);
+
+  var precipitation = annualPrecipitation(year);
+
+  var rainDays = annualRainDays(year);
+
+  var ndvi = annualNDVI(year);
+
+  // Bring continuous factors to common working grid
+  var Pmm = to1km(precipitation);
+
+  var rainDays1km = to1km(rainDays);
+
+  var ndvi1km = to1km(ndvi);
+
+  // ------------------------------------------------------------------------
+  // R FACTOR: EMPIRICAL RAINFALL EROSIVITY PROXY
+  // ------------------------------------------------------------------------
+
+  var R = Pmm
+    .multiply(
+      rainDays1km.divide(365).add(0.5)
+    )
+    .multiply(0.35)
+    .rename('R_factor');
+
+  // ------------------------------------------------------------------------
+  // C FACTOR: NDVI-BASED COVER MANAGEMENT
+  // ------------------------------------------------------------------------
+
+  var ndviClamped = ndvi1km.clamp(-0.99, 0.99);
+
+  var C = ndviClamped
+    .divide(
+      ee.Image.constant(1)
+        .subtract(ndviClamped)
+        .add(0.000001)
+    )
+    .multiply(-2)
+    .exp()
+    .clamp(0, 1)
+    .where(ndvi1km.lte(0), 1)
+    .rename('C_factor');
+
+  // ------------------------------------------------------------------------
+  // TERRACE EFFECT
+  // ------------------------------------------------------------------------
+
+  var terraceEffect = terraceFraction
+    .multiply(-ETA)
+    .exp();
+
+  var LS_withTerrace = LSbase
+    .multiply(terraceEffect)
+    .rename('LS_terraced');
+
+  var P_withTerrace = terraceEffect
+    .rename('P_terraced');
+
+  // ------------------------------------------------------------------------
+  // EROSION WITHOUT TERRACING
+  // ------------------------------------------------------------------------
+
+  var erosionWithout = R
+    .multiply(K)
+    .multiply(LSbase)
+    .multiply(C)
+    .rename('erosion_without_terracing');
+
+  // ------------------------------------------------------------------------
+  // EROSION WITH TERRACING
+  // ------------------------------------------------------------------------
+
+  var erosionWith = R
+    .multiply(K)
+    .multiply(LS_withTerrace)
+    .multiply(C)
+    .multiply(P_withTerrace)
+    .rename('erosion_with_terracing');
+
+  // ------------------------------------------------------------------------
+  // MODELLED EROSION REDUCTION
+  // ------------------------------------------------------------------------
+
+  var erosionReduction = erosionWithout
+    .subtract(erosionWith)
+    .max(0)
+    .rename('erosion_reduction')
+    .updateMask(dem.gt(0))
+    .clip(region);
+
+  // Combined output
+  var output = ee.Image.cat([
+    Pmm,
+    rainDays1km,
+    ndvi1km,
+    R,
+    K,
+    LSbase,
+    C,
+    terraceFraction,
+    erosionWithout,
+    erosionWith,
+    erosionReduction
+  ]).toFloat().clip(region);
+
+  // ------------------------------------------------------------------------
+  // EXPORT ANNUAL IMAGE
+  // ------------------------------------------------------------------------
+
+  Export.image.toDrive({
+    image: output,
+    description: 'Zulihe_RUSLE_AllFactors_' + year,
+    folder: EXPORT_FOLDER,
+    fileNamePrefix: 'Zulihe_RUSLE_AllFactors_' + year,
+    region: region,
+    crs: CRS,
+    scale: TARGET_SCALE,
+    maxPixels: 1e13
+  });
+
+  // ------------------------------------------------------------------------
+  // EXPORT EROSION REDUCTION IMAGE
+  // ------------------------------------------------------------------------
+
+  Export.image.toDrive({
+    image: erosionReduction.toFloat(),
+    description: 'Zulihe_Erosion_Reduction_' + year,
+    folder: EXPORT_FOLDER,
+    fileNamePrefix: 'Zulihe_Erosion_Reduction_' + year,
+    region: region,
+    crs: CRS,
+    scale: TARGET_SCALE,
+    maxPixels: 1e13
+  });
+
+  // ------------------------------------------------------------------------
+  // SUMMARY STATISTICS
+  // ------------------------------------------------------------------------
+
+  var terracedReduction = erosionReduction
+    .updateMask(terraceFraction.gt(0.01));
+
+  var stats = terracedReduction.reduceRegion({
+    reducer: ee.Reducer.mean()
+      .combine({
+        reducer2: ee.Reducer.stdDev(),
+        sharedInputs: true
+      })
+      .combine({
+        reducer2: ee.Reducer.median(),
+        sharedInputs: true
+      })
+      .combine({
+        reducer2: ee.Reducer.percentile([90, 95]),
+        sharedInputs: true
+      })
+      .combine({
+        reducer2: ee.Reducer.max(),
+        sharedInputs: true
+      })
+      .combine({
+        reducer2: ee.Reducer.count(),
+        sharedInputs: true
+      }),
+    geometry: region,
+    scale: TARGET_SCALE,
+    crs: CRS,
+    bestEffort: true,
+    maxPixels: 1e13,
+    tileScale: 4
+  });
+
+  print('Erosion reduction statistics: ' + year, stats);
+
+  var summaryFeature = ee.Feature(null, {
+    year: year,
+    mean_reduction: stats.get('erosion_reduction_mean'),
+    standard_deviation: stats.get('erosion_reduction_stdDev'),
+    median_reduction: stats.get('erosion_reduction_median'),
+    percentile_90: stats.get('erosion_reduction_p90'),
+    percentile_95: stats.get('erosion_reduction_p95'),
+    maximum_reduction: stats.get('erosion_reduction_max'),
+    pixel_count: stats.get('erosion_reduction_count')
+  });
+
+  summaryList.push(summaryFeature);
+
+  // ------------------------------------------------------------------------
+  // VISUALIZATION
+  // ------------------------------------------------------------------------
+
+  if (year === visualYear) {
+
+    visReduction = erosionReduction;
+
+    visTerrace = terraceFraction;
+
+  }
+
+  Map.addLayer(
+    ndvi1km,
+    {
+      min: 0,
+      max: 0.8,
+      palette: ['brown', 'yellow', 'green']
+    },
+    'NDVI ' + year,
+    false
+  );
+
+  Map.addLayer(
+    erosionWithout,
+    {
+      min: 0,
+      max: 50,
+      palette: ['white', 'yellow', 'orange', 'red']
+    },
+    'Erosion without terraces ' + year,
+    false
+  );
+
+  Map.addLayer(
+    erosionWith,
+    {
+      min: 0,
+      max: 50,
+      palette: ['white', 'lightblue', 'blue', 'darkblue']
+    },
+    'Erosion with terraces ' + year,
+    false
+  );
+
+});
+
+
+// ============================================================================
+// 9. EXPORT SUMMARY TABLE
+// ============================================================================
+
+var summaryTable = ee.FeatureCollection(summaryList);
+
+print('Zulihe annual RUSLE summary', summaryTable);
+
+Export.table.toDrive({
+  collection: summaryTable,
+  description: 'Zulihe_RUSLE_Annual_Summary',
+  folder: EXPORT_FOLDER,
+  fileNamePrefix: 'Zulihe_RUSLE_Annual_Summary',
+  fileFormat: 'CSV'
+});
+
+
+// ============================================================================
+// 10. FINAL MAP VISUALIZATION
+// ============================================================================
+
+Map.addLayer(
+  LSbase,
+  {
+    min: 0,
+    max: 20,
+    palette: ['white', 'yellow', 'orange', 'brown']
+  },
+  'Baseline LS factor',
+  false
+);
+
+Map.addLayer(
+  K,
+  {
+    min: 0.05,
+    max: 0.6,
+    palette: ['white', 'yellow', 'brown']
+  },
+  'Soil erodibility proxy',
+  false
+);
+
+Map.addLayer(
+  visTerrace,
+  {
+    min: 0,
+    max: 1,
+    palette: ['white', 'cyan', 'blue']
+  },
+  'Terrace fraction ' + visualYear,
+  true
+);
+
+Map.addLayer(
+  visReduction,
+  {
+    min: 0,
+    max: 50,
+    palette: ['white', 'yellow', 'orange', 'red', 'darkred']
+  },
+  'Modelled erosion reduction ' + visualYear,
+  true
+);
+
+
+// ============================================================================
+// 11. REPRODUCIBILITY INFORMATION
+// ============================================================================
+
+print('ZULIHE RUSLE WORKFLOW FINISHED');
+
+print('Study area: Zulihe Watershed');
+
+print('Benchmark years:', years);
+
+print('Working resolution:', TARGET_SCALE, 'm');
+
+print('Projection:', CRS);
+
+print('Terrace asset mode:', USE_TERRACE_ASSETS);
+
+print('Terrace scenario fraction:', SCENARIO_TERRACE_FRACTION);
+
+print('Export folder:', EXPORT_FOLDER);
+
+print('IMPORTANT: Start the export tasks from the Tasks tab.');
+print('IMPORTANT: Scenario terrace coverage is not observed terrace data.');
+print('IMPORTANT: R and K factors require local calibration for absolute units.');
