@@ -1,0 +1,48 @@
+
+# Zulihe SHAP Analysis Repository
+
+## Study
+Terracing enhances landscape ecological resilience
+through erosion reduction on China's Loess Plateau.
+
+## Purpose
+This repository provides the R scripts and input
+data required to reproduce the SHAP feature
+importance analysis and summary visualization.
+
+## Data
+The input file contains model-derived SHAP values
+and corresponding predictor values.
+
+## Variables
+- Feature: Predictor name
+- SHAP_value: Model-derived SHAP contribution
+- Feature_value: Corresponding predictor value
+
+## Software
+R (version 4.3 or later)
+
+Required packages:
+- ggplot2
+- dplyr
+- readr
+- patchwork
+- scales
+
+## Reproducibility
+Run Scripts/01_SHAP_Analysis.R from the
+repository root directory.
+
+The script generates:
+- Figure4_SHAP.tiff
+- Figure4_SHAP.pdf
+- SHAP_Global_Importance.csv
+
+## Data integrity
+All input values must originate from the actual
+study data and fitted model. No simulated or
+artificial observations are included.
+
+## License
+Specify the license applicable to the shared
+data and code.
