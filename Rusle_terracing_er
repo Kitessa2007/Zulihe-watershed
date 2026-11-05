@@ -4,9 +4,7 @@
 // Study area: Zulihe Watershed, Loess Plateau, China
 // Benchmark years: 1995, 2010, 2025
 // Working resolution: 1 km
-//
-// Platform: Google Earth Engine JavaScript
-//
+ //Units: Soil erosion reduction (t .ha-1. yr-1)
 // DATA SOURCES:
 // 1. CHIRPS Daily precipitation
 // 2. ERA5-Land Daily precipitation
